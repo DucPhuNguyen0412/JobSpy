@@ -33,6 +33,7 @@ from ...jobs import (
 class ZipRecruiterScraper(Scraper):
     def __init__(self, proxy: Optional[str] = None):
         """
+        Constructor for the ZipRecruiterScraper.
         Initializes LinkedInScraper with the ZipRecruiter job search url
         """
         site = Site(Site.ZIP_RECRUITER)
@@ -53,6 +54,7 @@ class ZipRecruiterScraper(Scraper):
         """
         session = create_session(self.proxy)
         try:
+            # Making a GET request to fetch job listings
             response = session.get(
                 f"{self.url}/jobs-search",
                 headers=self.headers(),
@@ -60,18 +62,20 @@ class ZipRecruiterScraper(Scraper):
                 allow_redirects=True,
                 timeout_seconds=10,
             )
-            if response.status_code != 200:
+            if response.status_code != 200: # Handling non-200 status codes
                 raise ZipRecruiterException(
                     f"bad response status code: {response.status_code}"
                 )
-        except Exception as e:
-            if "Proxy responded with non 200 code" in str(e):
+        except Exception as e: # Specific error handling for proxy issues
+            if "Proxy responded with non 200 code" in str(e): 
                 raise ZipRecruiterException("bad proxy")
             raise ZipRecruiterException(str(e))
         else:
+            # Parsing the response content with BeautifulSoup
             soup = BeautifulSoup(response.text, "html.parser")
             js_tag = soup.find("script", {"id": "js_variables"})
 
+        # Identify the structure of the page (Javasrcipts or html)
         if js_tag:
             page_json = json.loads(js_tag.string)
             jobs_list = page_json.get("jobList")
@@ -87,6 +91,7 @@ class ZipRecruiterScraper(Scraper):
             jobs_list = soup.find_all("li", {"class": "job-listing"})
             # print('type 1 html', len(jobs_list))
 
+        # Process jobs concurrently based on the identified page variant
         with ThreadPoolExecutor(max_workers=10) as executor:
             if page_variant == "javascript":
                 job_results = [
@@ -102,6 +107,7 @@ class ZipRecruiterScraper(Scraper):
                     executor.submit(self.process_job_html_2, job) for job in jobs_list
                 ]
 
+        # Gather all the results and filter out any None values
         job_list = [result.result() for result in job_results if result.result()]
         return job_list
 
@@ -111,33 +117,44 @@ class ZipRecruiterScraper(Scraper):
         :param scraper_input:
         :return: job_response
         """
-        start_page = (
+        start_page = ( # Determine starting page
             (scraper_input.offset // self.jobs_per_page) + 1
             if scraper_input.offset
             else 1
         )
         #: get first page to initialize session
         job_list: list[JobPost] = self.find_jobs_in_page(scraper_input, start_page)
+        
+         # Determine the number of pages to process, at least 3 or based on the desired number of results.
         pages_to_process = max(
             3, math.ceil(scraper_input.results_wanted / self.jobs_per_page)
         )
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # Use ThreadPoolExecutor to scrape multiple pages concurrently
+        with ThreadPoolExecutor(max_workers=10) as executor: 
             futures: list[Future] = [
                 executor.submit(self.find_jobs_in_page, scraper_input, page)
                 for page in range(start_page + 1, start_page + pages_to_process + 2)
             ]
 
-            for future in futures:
+            for future in futures:  # Aggregate the results from each page into the job_list
                 jobs = future.result()
 
                 job_list += jobs
 
+        # Limit the job list to the number of desired results
         job_list = job_list[: scraper_input.results_wanted]
+        
         return JobResponse(jobs=job_list)
 
     def process_job_javascript(self, job: dict) -> JobPost:
-        """the most common type of jobs page on ZR"""
+        """
+        Process a job listing fetched via JavaScript. This represents the most common structure on ZipRecruiter.
+        
+        :param job: The dictionary containing job details.
+        :return: A JobPost object populated with the job details.
+        """
+        # Extracting job details from the provided dictionary
         title = job.get("Title")
         job_url = job.get("JobURL")
 
@@ -148,6 +165,7 @@ class ZipRecruiterScraper(Scraper):
                 job.get("Snippet", "").strip(), "html.parser"
             ).get_text()
 
+        # Extracting job attributes
         company = job.get("OrgName")
         location = Location(
             city=job.get("City"), state=job.get("State"), country=Country.US_CANADA
@@ -156,6 +174,7 @@ class ZipRecruiterScraper(Scraper):
             job.get("EmploymentType", "").replace("-", "").lower()
         )
 
+        # Parsing salary information
         formatted_salary = job.get("FormattedSalaryShort", "")
         salary_parts = formatted_salary.split(" ")
 
@@ -180,6 +199,8 @@ class ZipRecruiterScraper(Scraper):
             max_amount=max_amount,
             currency="USD/CAD",
         )
+        
+        # Extracting the posting date. If not available, default to today's date.
         save_job_url = job.get("SaveJobURL", "")
         posted_time_match = re.search(
             r"posted_time=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", save_job_url
@@ -191,6 +212,7 @@ class ZipRecruiterScraper(Scraper):
         else:
             date_posted = date.today()
 
+        # Construct and return a JobPost object with the parsed details
         return JobPost(
             title=title,
             company_name=company,
@@ -215,11 +237,15 @@ class ZipRecruiterScraper(Scraper):
         title = job.find("h2", class_="title").text
         company = job.find("a", class_="company_name").text.strip()
 
+        # Fetching the job description and potentially updating the job URL
         description, updated_job_url = self.get_description(job_url)
         # job_url = updated_job_url if updated_job_url else job_url
+    
+        # Fallback to extract description from snippet if not available in the initial fetch
         if description is None:
             description = job.find("p", class_="job_snippet").get_text().strip()
 
+        # Extracting the job type
         job_type_text = job.find("li", class_="perk_item perk_type")
         job_type = None
         if job_type_text:
@@ -231,8 +257,11 @@ class ZipRecruiterScraper(Scraper):
                 .replace(" ", "")
             )
             job_type = ZipRecruiterScraper.get_job_type_enum(job_type_text)
+            
+        # Extracting the date the job was posted
         date_posted = ZipRecruiterScraper.get_date_posted(job)
 
+        # Constructing the JobPost object with the parsed details
         job_post = JobPost(
             title=title,
             company_name=company,
@@ -247,6 +276,7 @@ class ZipRecruiterScraper(Scraper):
         )
         return job_post
 
+    # Similar with process_job_html_2
     def process_job_html_1(self, job: Tag) -> Optional[JobPost]:
         """
         TODO this method isnt finished due to not encountering this type of html often
@@ -295,6 +325,12 @@ class ZipRecruiterScraper(Scraper):
 
     @staticmethod
     def get_job_type_enum(job_type_str: str) -> list[JobType] | None:
+        """
+        Convert a string representation of a job type into its respective JobType enum value.
+        
+        :param job_type_str: String representation of the job type.
+        :return: Corresponding JobType enum value or None if not found.
+        """
         for job_type in JobType:
             if job_type_str in job_type.value:
                 return [job_type]
@@ -320,6 +356,8 @@ class ZipRecruiterScraper(Scraper):
             return None, None
 
         html_string = response.content
+        
+        # Parsing the job description from the fetched HTML content
         soup_job = BeautifulSoup(html_string, "html.parser")
 
         job_description_div = soup_job.find("div", {"class": "job_description"})
@@ -371,7 +409,7 @@ class ZipRecruiterScraper(Scraper):
             return interval_alias[interval_str]
 
         return CompensationInterval(interval_str)
-
+    
     @staticmethod
     def get_date_posted(job: Tag) -> Optional[datetime.date]:
         """
@@ -379,17 +417,20 @@ class ZipRecruiterScraper(Scraper):
         :param job
         :return: date the job was posted or None
         """
+        # Find the button element containing the posting date information
         button = job.find(
             "button", {"class": "action_input save_job zrs_btn_secondary_200"}
         )
         if not button:
             return None
 
+        # Extract the date from the button's data-href attribute
         url_time = button.get("data-href", "")
         url_components = urlparse(url_time)
         params = parse_qs(url_components.query)
         posted_time_str = params.get("posted_time", [None])[0]
 
+        # Convert the extracted date string into a datetime.date object
         if posted_time_str:
             posted_date = datetime.strptime(
                 posted_time_str, "%Y-%m-%dT%H:%M:%SZ"
@@ -405,6 +446,7 @@ class ZipRecruiterScraper(Scraper):
         :param job
         :return: Compensation object or None
         """
+        # Find the pay element within the job listing
         pay_element = job.find("li", {"class": "perk_item perk_pay"})
         if pay_element is None:
             return None
@@ -416,8 +458,10 @@ class ZipRecruiterScraper(Scraper):
             :param pay_string
             :return: compensation
             """
+            # Determine the payment interval (e.g., annually)
             interval = ZipRecruiterScraper.get_interval(pay_string.split()[-1])
 
+            # Extract minimum and maximum salary amounts from the pay string
             amounts = []
             for amount in pay_string.split("to"):
                 amount = amount.replace(",", "").strip("$ ").split(" ")[0]
@@ -428,6 +472,7 @@ class ZipRecruiterScraper(Scraper):
                     amount = int(float(amount))
                 amounts.append(amount)
 
+            # Create and return the Compensation object
             compensation = Compensation(
                 interval=interval,
                 min_amount=min(amounts),
@@ -446,6 +491,7 @@ class ZipRecruiterScraper(Scraper):
         :param job:
         :return: location
         """
+        # Find the location element within the job listing
         location_link = job.find("a", {"class": "company_location"})
         if location_link is not None:
             location_string = location_link.text.strip()
